@@ -87,7 +87,7 @@ def download_and_convert(image_url: str) -> tuple[io.BytesIO, str]:
 
 
 def upload_jpeg(jpeg_bytes: io.BytesIO, filename: str) -> str:
-    """Sube el JPEG convertido a /Carousel/upload y devuelve la nueva URL."""
+    """Sube el JPEG convertido a /Carousel/upload y devuelve la nueva URL de forma robusta."""
     upload_url = f"https://app.ontraport.com/Carousel/upload?aid={AID}"
 
     headers = {
@@ -108,13 +108,38 @@ def upload_jpeg(jpeg_bytes: io.BytesIO, filename: str) -> str:
     res = requests.post(upload_url, headers=headers, files=files)
     res.raise_for_status()
 
-    res_json = res.json()
-    file_data = res_json.get("data", {}).get("file_data", {})
-    new_url = file_data.get("URL")
+    new_url = None
+
+    # Extracción segura ante cualquier formato de res.json()
+    try:
+        res_json = res.json()
+        if isinstance(res_json, dict):
+            data_val = res_json.get("data")
+            if isinstance(data_val, dict):
+                file_data = data_val.get("file_data")
+                if isinstance(file_data, dict):
+                    new_url = file_data.get("URL") or file_data.get("url")
+                if not new_url:
+                    new_url = data_val.get("URL") or data_val.get("url")
+            elif isinstance(data_val, str) and "http" in data_val:
+                new_url = data_val
+
+            if not new_url:
+                new_url = res_json.get("URL") or res_json.get("url")
+    except Exception:
+        pass
+
+    # Si no vino estructurado en JSON, extraer con regex directo del texto
+    if not new_url:
+        match = re.search(r"https://i\.ontraport\.com/[^\s\"'<>]+", res.text)
+        if match:
+            new_url = match.group(0)
 
     if not new_url:
-        raise ValueError(f"No se encontró la clave URL en la respuesta: {res_json}")
+        raise ValueError(f"No se pudo extraer la nueva URL del servidor. Respuesta: {res.text}")
 
+    # Limpiar posibles barras invertidas devueltas por JSON
+    new_url = str(new_url).replace("\\/", "/")
     return new_url
 
 
@@ -269,48 +294,50 @@ def process_single_contact(link_or_id: str, auto_confirm: bool = False) -> tuple
     image_val = contact.get(FIELD_IMAGE)
     print(f"-> Email: {email if email else 'No asignado'}")
 
+    image_updated = False
+    skip_reason = None
+
     # 2. Validar imagen
     if not image_val or not str(image_val).strip():
-        msg = "No tiene foto de perfil"
-        print(f"[-] AVISO: {msg}.")
-        return False, msg
-
-    if str(image_val).lower().endswith(".jpeg") or str(image_val).lower().endswith(".jpg"):
-        msg = f"La foto ya es JPEG ({image_val})"
-        print(f"-> {msg}.")
-        return False, msg
-
-    current_url = image_val if image_val.startswith("http") else f"https://i.ontraport.com/{image_val}"
-    print(f"-> Imagen encontrada: {current_url}")
-
-    # 3. Conversión y subida
-    try:
-        jpeg_bytes, new_filename = download_and_convert(current_url)
-        print(f"-> Subiendo archivo: {new_filename} ...")
-        new_url = upload_jpeg(jpeg_bytes, filename=new_filename)
-        print(f"-> Subida exitosa: {new_url}")
-
-        print(f"-> Guardando en contacto...")
-        update_contact_image(contact_id, new_url)
-        print(f"[✓] Imagen actualizada a JPEG con éxito.")
-    except Exception as e:
-        msg = f"Error al convertir/subir la imagen: {e}"
-        print(f"[-] {msg}")
-        return False, msg
-
-    # 4. Actualización a Passkit
-    apply_update = True if auto_confirm else ask_confirmation("¿Aplicar el Passkit - Update?")
-    if apply_update:
-        try:
-            print(f"-> Disparando actualización a Passkit (categoría 927)...")
-            trigger_passkit_update(contact_id)
-            print(f"[✓] Passkit actualizado correctamente.")
-        except Exception as e:
-            print(f"[-] Error al disparar actualización a Passkit: {e}")
+        skip_reason = "No tiene foto de perfil"
+        print(f"[-] AVISO: {skip_reason}. Saltando conversión y Passkit Update...")
+    elif str(image_val).lower().endswith(".jpeg") or str(image_val).lower().endswith(".jpg"):
+        skip_reason = f"La foto ya es JPEG ({image_val})"
+        print(f"-> {skip_reason}. Saltando conversión y Passkit Update...")
     else:
-        print(f"[-] Passkit Update omitido.")
+        current_url = image_val if image_val.startswith("http") else f"https://i.ontraport.com/{image_val}"
+        print(f"-> Imagen encontrada: {current_url}")
 
-    # 5. Enlace de miembro Passkit
+        # 3. Conversión y subida
+        try:
+            jpeg_bytes, new_filename = download_and_convert(current_url)
+            print(f"-> Subiendo archivo: {new_filename} ...")
+            new_url = upload_jpeg(jpeg_bytes, filename=new_filename)
+            print(f"-> Subida exitosa: {new_url}")
+
+            print(f"-> Guardando en contacto...")
+            update_contact_image(contact_id, new_url)
+            print(f"[✓] Imagen actualizada a JPEG con éxito.")
+            image_updated = True
+        except Exception as e:
+            msg = f"Error al convertir/subir la imagen: {e}"
+            print(f"[-] {msg}")
+            return False, msg
+
+    # 4. Actualización a Passkit (solo si se convirtió una imagen con éxito)
+    if image_updated:
+        apply_update = True if auto_confirm else ask_confirmation("¿Aplicar el Passkit - Update?")
+        if apply_update:
+            try:
+                print(f"-> Disparando actualización a Passkit (categoría 927)...")
+                trigger_passkit_update(contact_id)
+                print(f"[✓] Passkit actualizado correctamente.")
+            except Exception as e:
+                print(f"[-] Error al disparar actualización a Passkit: {e}")
+        else:
+            print(f"[-] Passkit Update omitido.")
+
+    # 5. Enlace de miembro Passkit (siempre disponible si hay correo)
     generate_link = True if auto_confirm else ask_confirmation("¿Deseas generar el enlace de miembro Passkit?")
     if generate_link:
         if email:
@@ -322,6 +349,9 @@ def process_single_contact(link_or_id: str, auto_confirm: bool = False) -> tuple
                 print(f"[-] Error al generar enlace de Passkit: {e}")
         else:
             print("[-] Contacto sin correo, enlace omitido.")
+
+    if not image_updated:
+        return False, skip_reason
 
     print(f"[✓] Contacto {contact_id} completado con éxito.")
     return True, "Procesado correctamente"
@@ -376,7 +406,7 @@ def process_excel(file_path: str):
                 "MOTIVO_FALLO": str(e)
             })
 
-        # Pausa de 3 segundos entre contactos (excepto después del último)
+        # Pausa de 3 segundos entre contactos
         if idx < total:
             print("-> Esperando 3 segundos antes del siguiente contacto...")
             time.sleep(3)
