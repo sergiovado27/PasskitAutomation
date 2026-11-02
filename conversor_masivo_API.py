@@ -260,36 +260,61 @@ def ask_confirmation(prompt_text: str) -> bool:
         print("Opción no válida. Por favor escribe 'y' o 'n'.")
 
 
-def process_single_contact(link_or_id: str, auto_confirm: bool = False) -> tuple[bool, str]:
+def process_single_contact(link_or_id: str, auto_confirm: bool = False) -> tuple[bool, str, str]:
+    """
+    Procesa un contacto individual.
+    Retorna (éxito: bool, motivo: str, passkit_url: str).
+    """
     contact_id = extract_contact_id(link_or_id)
     print(f"\n==========================================")
     print(f"[+] Procesando Contacto ID: {contact_id}")
     print(f"==========================================")
 
+    member_url = "NOTENROLLED"
+
+    # 1. Obtener datos
     try:
         contact = get_contact_data(contact_id)
     except Exception as e:
         msg = f"Error al consultar contacto en Ontraport: {e}"
         print(f"[-] {msg}")
-        return False, msg
+        return False, msg, member_url
 
     email = contact.get("email")
     image_val = contact.get(FIELD_IMAGE)
     print(f"-> Email: {email if email else 'No asignado'}")
 
+    # 2. Consultar Passkit TEMPRANO para tener el dato en el reporte, incluso si falla la imagen
+    generate_link = True if auto_confirm else ask_confirmation("¿Deseas buscar el enlace de miembro Passkit?")
+    if generate_link:
+        if email:
+            try:
+                print(f"-> Consultando miembro en Passkit...")
+                member_url = get_passkit_member_url(email)
+                print(f"\n🔗 [ENLACE DE MIEMBRO PASSKIT]:\n{member_url}\n")
+            except Exception as e:
+                print(f"[-] No se encontró miembro en Passkit o hubo error.")
+                member_url = "NOTENROLLED"
+        else:
+            print("[-] Contacto sin correo, enlace omitido.")
+
     image_updated = False
     skip_reason = None
 
+    # 3. Validar imagen
     if not image_val or not str(image_val).strip():
         skip_reason = "No tiene foto de perfil"
         print(f"[-] AVISO: {skip_reason}. Saltando conversión y Passkit Update...")
+        return False, skip_reason, member_url
     elif str(image_val).lower().endswith(".jpeg") or str(image_val).lower().endswith(".jpg"):
         skip_reason = f"La foto ya es JPEG ({image_val})"
         print(f"-> {skip_reason}. Saltando conversión y Passkit Update...")
+        return False, skip_reason, member_url
     else:
         current_url = image_val if image_val.startswith("http") else f"https://i.ontraport.com/{image_val}"
         print(f"-> Imagen encontrada: {current_url}")
 
+        # 4. Conversión y subida
         try:
             jpeg_bytes, new_filename = download_and_convert(current_url)
             print(f"-> Subiendo archivo: {new_filename} ...")
@@ -303,10 +328,11 @@ def process_single_contact(link_or_id: str, auto_confirm: bool = False) -> tuple
         except Exception as e:
             msg = f"Error al convertir/subir la imagen: {e}"
             print(f"[-] {msg}")
-            return False, msg
+            return False, msg, member_url
 
+    # 5. Actualización a Passkit (solo si se convirtió una imagen con éxito)
     if image_updated:
-        apply_update = True if auto_confirm else ask_confirmation("¿Aplicar el Passkit - Update?")
+        apply_update = True if auto_confirm else ask_confirmation("¿Aplicar el Passkit - Update (Cat 927)?")
         if apply_update:
             try:
                 print(f"-> Disparando actualización a Passkit (categoría 927)...")
@@ -317,32 +343,19 @@ def process_single_contact(link_or_id: str, auto_confirm: bool = False) -> tuple
         else:
             print(f"[-] Passkit Update omitido.")
 
-    generate_link = True if auto_confirm else ask_confirmation("¿Deseas generar el enlace de miembro Passkit?")
-    if generate_link:
-        if email:
-            try:
-                print(f"-> Consultando miembro en Passkit...")
-                member_url = get_passkit_member_url(email)
-                print(f"\n🔗 [ENLACE DE MIEMBRO PASSKIT]:\n{member_url}\n")
-            except Exception as e:
-                print(f"[-] Error al generar enlace de Passkit: {e}")
-        else:
-            print("[-] Contacto sin correo, enlace omitido.")
-
-    if not image_updated:
-        return False, skip_reason
-
     print(f"[✓] Contacto {contact_id} completado con éxito.")
-    return True, "Procesado correctamente"
+    return True, "Procesado correctamente", member_url
 
 
 def process_excel(file_path: str):
+    """Lee el Excel y ejecuta el proceso en lote automáticamente con pausa."""
     if not os.path.exists(file_path):
         print(f"Error: No existe el archivo en la ruta '{file_path}'.")
         return
 
     df = pd.read_excel(file_path)
 
+    # Identificar la columna de contactos
     col_name = None
     for candidate in ["CONTACTS", "contacts", "contacto", "contactos", "link", "url"]:
         for c in df.columns:
@@ -367,26 +380,32 @@ def process_excel(file_path: str):
         print(f"\n[{idx}/{total}] Procesando...")
         try:
             contact_id = extract_contact_id(link)
-            success, reason = process_single_contact(link, auto_confirm=True)
+            # Desempaquetamos 3 variables ahora
+            success, reason, passkit_url = process_single_contact(link, auto_confirm=True)
+            
             if success:
                 success_count += 1
             else:
                 unsuccessful_records.append({
                     "CONTACT_URL": link,
                     "CONTACT_ID": contact_id,
-                    "MOTIVO_FALLO": reason
+                    "MOTIVO_FALLO": reason,
+                    "PASSKIT_URL": passkit_url
                 })
         except Exception as e:
             unsuccessful_records.append({
                 "CONTACT_URL": link,
                 "CONTACT_ID": "DESCONOCIDO",
-                "MOTIVO_FALLO": str(e)
+                "MOTIVO_FALLO": str(e),
+                "PASSKIT_URL": "NOTENROLLED"
             })
 
+        # Pausa de 3 segundos entre contactos
         if idx < total:
             print("-> Esperando 3 segundos antes del siguiente contacto...")
             time.sleep(3)
 
+    # Guardar reporte de contactos no exitosos
     output_filename = "contactos_no_exitosos.xlsx"
     if unsuccessful_records:
         df_failed = pd.DataFrame(unsuccessful_records)
